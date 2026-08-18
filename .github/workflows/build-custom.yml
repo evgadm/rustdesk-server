@@ -1,0 +1,67 @@
+name: Build custom RustDesk Server
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - rustdesk-admin-1.1.16
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/build-custom.yml"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux-amd64:
+    name: Build Linux amd64 custom
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: "1.90"
+          override: true
+          default: true
+          profile: minimal
+          target: x86_64-unknown-linux-musl
+
+      - name: Build static binaries
+        uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --release --all-features --target=x86_64-unknown-linux-musl
+          use-cross: true
+
+      - name: Verify binaries
+        shell: bash
+        run: |
+          file target/x86_64-unknown-linux-musl/release/hbbs
+          file target/x86_64-unknown-linux-musl/release/hbbr
+          target/x86_64-unknown-linux-musl/release/hbbs --version
+          target/x86_64-unknown-linux-musl/release/hbbr --version
+          sha256sum \
+            target/x86_64-unknown-linux-musl/release/hbbs \
+            target/x86_64-unknown-linux-musl/release/hbbr
+
+      - name: Upload custom server binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-server-custom-1.1.16-linux-amd64
+          path: |
+            target/x86_64-unknown-linux-musl/release/hbbs
+            target/x86_64-unknown-linux-musl/release/hbbr
+            target/x86_64-unknown-linux-musl/release/rustdesk-utils
+          if-no-files-found: error
+          retention-days: 30
