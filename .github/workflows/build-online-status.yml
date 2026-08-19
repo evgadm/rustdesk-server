@@ -1,0 +1,161 @@
+name: Build RustDesk hbbs with online status
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout current branch
+        uses: actions/checkout@v4
+
+      - name: Verify branch/source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          grep -q 'const REG_TIMEOUT: i64 = 30_000;' src/rendezvous_server.rs
+          grep -q 'pub(crate) async fn is_in_memory' src/peer.rs
+          grep -q 'use crate::blocked_ids::is_blocked;' src/rendezvous_server.rs
+
+      - name: Patch online status exporter
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          peer_path = Path("src/peer.rs")
+          rv_path = Path("src/rendezvous_server.rs")
+
+          peer = peer_path.read_text(encoding="utf-8")
+          rv = rv_path.read_text(encoding="utf-8")
+
+          if "pub(crate) async fn online_ids(" not in peer:
+              anchor = r'''    #[inline]
+              pub(crate) async fn is_in_memory(&self, id: &str) -> bool {
+                  self.map.read().await.contains_key(id)
+              }
+          }
+          '''
+              insert = r'''    #[inline]
+              pub(crate) async fn is_in_memory(&self, id: &str) -> bool {
+                  self.map.read().await.contains_key(id)
+              }
+
+              pub(crate) async fn online_ids(&self, timeout_ms: u64) -> Vec<String> {
+                  let peers: Vec<(String, LockPeer)> = {
+                      let map = self.map.read().await;
+                      map.iter()
+                          .map(|(id, peer)| (id.clone(), peer.clone()))
+                          .collect()
+                  };
+
+                  let mut ids = Vec::new();
+                  for (id, peer) in peers {
+                      if peer.read().await.last_reg_time.elapsed().as_millis() < timeout_ms as u128 {
+                          ids.push(id);
+                      }
+                  }
+                  ids.sort();
+                  ids
+              }
+          }
+          '''
+              if anchor not in peer:
+                  raise SystemExit("peer.rs anchor not found")
+              peer = peer.replace(anchor, insert, 1)
+
+          if "RUSTDESK_ONLINE_IDS_FILE" not in rv:
+              anchor = r'''        log::info!("mask: {:?}", rs.inner.mask);
+                  log::info!("local-ip: {:?}", rs.inner.local_ip);
+                  std::env::set_var("PORT_FOR_API", port.to_string());
+          '''
+              insert = r'''        log::info!("mask: {:?}", rs.inner.mask);
+                  log::info!("local-ip: {:?}", rs.inner.local_ip);
+
+                  let online_pm = rs.pm.clone();
+                  let online_file = std::env::var("RUSTDESK_ONLINE_IDS_FILE")
+                      .unwrap_or_else(|_| "/opt/rustdesk-admin/runtime/online_ids.json".to_owned());
+
+                  tokio::spawn(async move {
+                      let mut online_timer = interval(Duration::from_secs(5));
+                      loop {
+                          online_timer.tick().await;
+
+                          let ids: Vec<String> = online_pm
+                              .online_ids(REG_TIMEOUT as u64)
+                              .await
+                              .into_iter()
+                              .filter(|id| !is_blocked(id))
+                              .collect();
+
+                          let generated_at = std::time::SystemTime::now()
+                              .duration_since(std::time::UNIX_EPOCH)
+                              .map(|d| d.as_secs())
+                              .unwrap_or_default();
+
+                          let payload = serde_json::json!({
+                              "generated_at": generated_at,
+                              "online": ids,
+                          });
+
+                          let path = std::path::PathBuf::from(&online_file);
+                          if let Some(parent) = path.parent() {
+                              if let Err(err) = std::fs::create_dir_all(parent) {
+                                  log::warn!("Failed to create online status directory: {}", err);
+                                  continue;
+                              }
+                          }
+
+                          let tmp = path.with_extension("json.tmp");
+                          if let Err(err) = std::fs::write(&tmp, payload.to_string()) {
+                              log::warn!("Failed to write online status file: {}", err);
+                              continue;
+                          }
+
+                          if let Err(err) = std::fs::rename(&tmp, &path) {
+                              log::warn!("Failed to replace online status file: {}", err);
+                          }
+                      }
+                  });
+
+                  std::env::set_var("PORT_FOR_API", port.to_string());
+          '''
+              if anchor not in rv:
+                  raise SystemExit("rendezvous_server.rs anchor not found")
+              rv = rv.replace(anchor, insert, 1)
+
+          peer_path.write_text(peer, encoding="utf-8")
+          rv_path.write_text(rv, encoding="utf-8")
+          PY
+
+      - name: Show patch
+        run: git diff -- src/peer.rs src/rendezvous_server.rs
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.75.0
+          components: rustfmt
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Build hbbs
+        run: cargo build --release --bin hbbs
+
+      - name: Prepare artifact
+        run: |
+          mkdir -p artifact
+          cp target/release/hbbs artifact/hbbs
+          chmod +x artifact/hbbs
+          sha256sum artifact/hbbs > artifact/hbbs.sha256
+          file artifact/hbbs
+
+      - name: Upload hbbs
+        uses: actions/upload-artifact@v4
+        with:
+          name: hbbs-online-status-1.1.16-linux-amd64
+          path: artifact/
+          if-no-files-found: error
