@@ -3,18 +3,28 @@ name: Build RustDesk hbbs with online status
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  build:
-    runs-on: ubuntu-24.04
+  build-linux-amd64:
+    name: Build Linux amd64 online status
+    runs-on: ubuntu-22.04
 
     steps:
-      - name: Checkout current branch
+      - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
-      - name: Verify branch/source
+      - name: Verify source
         shell: bash
         run: |
           set -euxo pipefail
+          test -f libs/hbb_common/Cargo.toml
           grep -q 'const REG_TIMEOUT: i64 = 30_000;' src/rendezvous_server.rs
           grep -q 'pub(crate) async fn is_in_memory' src/peer.rs
           grep -q 'use crate::blocked_ids::is_blocked;' src/rendezvous_server.rs
@@ -131,27 +141,40 @@ jobs:
           PY
 
       - name: Show patch
+        shell: bash
         run: git diff -- src/peer.rs src/rendezvous_server.rs
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
         with:
-          toolchain: 1.75.0
-          components: rustfmt
+          toolchain: "1.90"
+          override: true
+          default: true
+          profile: minimal
+          target: x86_64-unknown-linux-musl
 
-      - name: Format
-        run: cargo fmt --all
+      - name: Build static binaries
+        uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --release --all-features --target=x86_64-unknown-linux-musl
+          use-cross: true
 
-      - name: Build hbbs
-        run: cargo build --release --bin hbbs
+      - name: Verify hbbs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          file target/x86_64-unknown-linux-musl/release/hbbs
+          target/x86_64-unknown-linux-musl/release/hbbs --version
+          sha256sum target/x86_64-unknown-linux-musl/release/hbbs > hbbs.sha256
+          cat hbbs.sha256
 
       - name: Prepare artifact
+        shell: bash
         run: |
           mkdir -p artifact
-          cp target/release/hbbs artifact/hbbs
-          chmod +x artifact/hbbs
-          sha256sum artifact/hbbs > artifact/hbbs.sha256
-          file artifact/hbbs
+          cp target/x86_64-unknown-linux-musl/release/hbbs artifact/hbbs
+          cp hbbs.sha256 artifact/hbbs.sha256
 
       - name: Upload hbbs
         uses: actions/upload-artifact@v4
@@ -159,3 +182,4 @@ jobs:
           name: hbbs-online-status-1.1.16-linux-amd64
           path: artifact/
           if-no-files-found: error
+          retention-days: 30
